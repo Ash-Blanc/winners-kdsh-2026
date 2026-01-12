@@ -7,6 +7,7 @@
 # • Final best: best_result.csv
 # • Output columns: story_id,prediction,rationale
 
+import utils.session
 from dotenv import load_dotenv
 import os
 import pathway as pw

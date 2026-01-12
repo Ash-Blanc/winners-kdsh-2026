@@ -12,3 +12,5 @@ wheels/
 # Logs and output
 *.log
 *.out
+config.bat
+node_modules
