@@ -108,11 +108,11 @@ class ConstraintEvolutionVerifier(dspy.Signature):
 
 # 8. DSPy Module
 class GlobalConsistencyPipeline(dspy.Module):
-    def __init__(self, document_store, retrieval_k=24):
+    def __init__(self, chunks, embeddings, retrieval_k=24):
         super().__init__()
-        # self.doc_store = document_store # Not using Pathway DocumentStore for sync retrieval
+        self.chunks = chunks
+        self.embeddings = embeddings
         self.k = retrieval_k
-        # Switching to Predict to avoid implicit 'reasoning' field and reduce output complexity
         self.reason = dspy.Predict(ConstraintEvolutionVerifier)
         
         class PipelineSignature(dspy.Signature):
@@ -121,46 +121,6 @@ class GlobalConsistencyPipeline(dspy.Module):
             label: int = dspy.OutputField()
             analysis: str = dspy.OutputField()
         self.signature = PipelineSignature
-
-        # Build local index for sync retrieval
-        print("Building local index for synchronous retrieval...")
-        self.chunks = []
-        self.embeddings = []
-        
-        # Load novels
-        novel_files = glob.glob(os.path.join(NOVELS_DIR, "*.txt"))
-        for nv in novel_files:
-            with open(nv, "r", encoding="utf-8") as f:
-                text = f.read()
-                # Simple splitting
-                # rough char estimation: 1000 tokens ~ 4000 chars
-                chunk_size = 4000
-                overlap = 600
-                for i in range(0, len(text), chunk_size - overlap):
-                    chunk = text[i:i + chunk_size]
-                    if len(chunk) > 100:
-                        self.chunks.append(chunk)
-        
-        print(f"Index: {len(self.chunks)} chunks. Embedding...")
-        
-        # Batch embedding to avoid rate limits/slow speed
-        batch_size = 10
-        for i in range(0, len(self.chunks), batch_size):
-            batch = self.chunks[i:i+batch_size]
-            try:
-                # Using mistral-embed via litellm
-                resp = embedding(model="mistral/mistral-embed", input=batch, api_key=MISTRAL_API_KEY)
-                for d in resp["data"]:
-                    self.embeddings.append(d["embedding"])
-            except Exception as e:
-                print(f"Embedding error: {e}")
-                # Fallback: add zero vectors or skip? 
-                # Better to fail loud or retry, but for now just skip to keep going
-                for _ in batch:
-                    self.embeddings.append([0.0]*1024) # Assuming 1024 dim
-                    
-        self.embeddings = np.array(self.embeddings)
-        print("Local index built.")
 
     def retrieve(self, query, k):
         # Embed query
@@ -209,6 +169,39 @@ trainset = [
 # ── Optimization & Tuning Loop ─────────────────────────────────────────
 print("Starting optimization & tuning process...")
 
+# Build local index ONCE outside the loop to save time and API costs
+print("Building local index for synchronous retrieval...")
+chunks = []
+embeddings_list = []
+
+# Load novels
+novel_files = glob.glob(os.path.join(NOVELS_DIR, "*.txt"))
+for nv in novel_files:
+    with open(nv, "r", encoding="utf-8") as f:
+        text = f.read()
+        chunk_size = 4000
+        overlap = 600
+        for i in range(0, len(text), chunk_size - overlap):
+            chunk = text[i:i + chunk_size]
+            if len(chunk) > 100:
+                chunks.append(chunk)
+
+print(f"Index: {len(chunks)} chunks. Embedding...")
+batch_size = 20
+for i in range(0, len(chunks), batch_size):
+    batch = chunks[i:i+batch_size]
+    try:
+        resp = embedding(model="mistral/mistral-embed", input=batch, api_key=MISTRAL_API_KEY)
+        for d in resp["data"]:
+            embeddings_list.append(d["embedding"])
+    except Exception as e:
+        print(f"Embedding error: {e}")
+        for _ in batch:
+            embeddings_list.append([0.0]*1024)
+            
+embeddings_arr = np.array(embeddings_list)
+print("Local index built.")
+
 best_acc = 0.0
 best_k = 24
 best_predictions = None
@@ -217,14 +210,10 @@ iteration = 0
 X_train = train_df.select(character=pl.col("char"), backstory=pl.col("content"))
 y_train = train_df["label"]
 
-# Slicing for quick verification of the fix (optional, can be removed for full run)
-# X_train = X_train.head(2)
-# y_train = y_train.head(2)
-
-for k in [18, 22, 24, 28, 32]: # Restored full loop
+for k in [18, 22, 24, 28, 32]:
     print(f"\nIteration {iteration} – testing retrieval k = {k}")
 
-    program = GlobalConsistencyPipeline(document_store=document_store, retrieval_k=k)
+    program = GlobalConsistencyPipeline(chunks=chunks, embeddings=embeddings_arr, retrieval_k=k)
 
     mator = DSPyMator(
         program=program,
